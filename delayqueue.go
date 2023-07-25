@@ -41,7 +41,7 @@ func NewDelayQueue(name string, redisCli *redis.Client, callback func(string) bo
 		panic("redis client is required")
 	}
 	if callback == nil {
-		panic("cb is required")
+		panic("callback is required")
 	}
 	return &DelayQueue{
 		name:               name,
@@ -104,7 +104,10 @@ func (q *DelayQueue) genID() (uint32, error) {
 		}
 		return 1, nil
 	}
-	return uint32(id), err
+	if err != nil {
+		return 0, fmt.Errorf("incr id gen failed: %v", err)
+	}
+	return uint32(id), nil
 }
 
 type retryCountOpt int
@@ -117,6 +120,7 @@ func WithRetryCount(count int) interface{} {
 
 // SendScheduleMsg 发送定时消息
 func (q *DelayQueue) SendScheduleMsg(payload string, t time.Time, opts ...interface{}) error {
+	// parse options
 	retryCount := q.defaultRetryCount
 	for _, opt := range opts {
 		switch o := opt.(type) {
@@ -160,9 +164,9 @@ func (q *DelayQueue) SendDelayMsg(payload string, duration time.Duration, opts .
 // pending2ReadyScript 将消息从pending列表移入ready列表 保证原子性
 // 参数：currentTime、pendingKey、readyKey
 const pending2ReadyScript = `
-local msgs = redis.call('ZRangeByScore',ARGV[2],'0',ARGV[1])
+local msgs = redis.call('ZRangeByScore', ARGV[2], '0', ARGV[1])  -- get ready msg
 if (#msgs == 0) then return end
-local args2 = {'LPush',ARGV[3]}
+local args2 = {'LPush', ARGV[3]} -- push into ready
 for _,v in ipairs(msgs) do
 		table.insert(args2,v)
 end
@@ -171,7 +175,7 @@ redis.call('ZRemRangeByScore',ARGV[2],'0',ARGV[1])
 `
 
 func (q *DelayQueue) pending2Ready() error {
-	now := time.Now()
+	now := time.Now().Unix()
 	ctx := context.Background()
 	keys := []string{q.pendingKey, q.readyKey}
 	err := q.redisCli.Eval(ctx, pending2ReadyScript, keys, now, q.pendingKey, q.readyKey).Err()
@@ -226,7 +230,7 @@ func (q *DelayQueue) retry2Unack() (string, error) {
 	return str, nil
 }
 
-func (q DelayQueue) callback(idStr string) (bool, error) {
+func (q *DelayQueue) callback(idStr string) (bool, error) {
 	ctx := context.Background()
 	payload, err := q.redisCli.Get(ctx, q.genMsgKey(idStr)).Result()
 	if err == redis.Nil {
@@ -244,6 +248,7 @@ func (q *DelayQueue) ack(idStr string) error {
 	if err != nil {
 		return fmt.Errorf("remove from unack failed: %v", err)
 	}
+	// msg key has ttl, ignore result of delete
 	_ = q.redisCli.Del(ctx, q.genMsgKey(idStr)).Err()
 	q.redisCli.HDel(ctx, q.retryCountKey, idStr)
 	return nil
@@ -271,11 +276,12 @@ end
 redis.call('ZRemRangeByScore', ARGV[2], '0', ARGV[1])  -- remove msgs from unack
 `
 
-func (q DelayQueue) unack2Retry() error {
+func (q *DelayQueue) unack2Retry() error {
 	ctx := context.Background()
 	keys := []string{q.unAckKey, q.retryKey, q.retryCountKey, q.garbageKey}
 	now := time.Now()
-	err := q.redisCli.Eval(ctx, unack2RetryScript, keys, now.Unix(), q.unAckKey, q.retryKey, q.garbageKey).Err()
+	err := q.redisCli.Eval(ctx, unack2RetryScript, keys,
+		now.Unix(), q.unAckKey, q.retryCountKey, q.retryKey, q.garbageKey).Err()
 	if err != nil && err != redis.Nil {
 		return fmt.Errorf("unack to retry script failed:%v", err)
 	}
@@ -292,6 +298,7 @@ func (q *DelayQueue) garbageCollect() error {
 	if len(msgIds) == 0 {
 		return nil
 	}
+	// allow concurrent clean
 	msgKeys := make([]string, 0, len(msgIds))
 	for _, idStr := range msgIds {
 		msgKeys = append(msgKeys, q.genMsgKey(idStr))
@@ -339,6 +346,7 @@ func (q *DelayQueue) consume() error {
 			break
 		}
 	}
+	// unack to retry
 	err = q.unack2Retry()
 	if err != nil {
 		return err

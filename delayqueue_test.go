@@ -2,6 +2,7 @@ package delayqueue
 
 import (
 	"context"
+	"fmt"
 	"github.com/go-redis/redis/v8"
 	"log"
 	"math"
@@ -38,6 +39,7 @@ func TestDelayQueue_consume(t *testing.T) {
 	}
 	for i := 0; i < 10*size; i++ {
 		err := queue.consume()
+		fmt.Println("执行到", i)
 		if err != nil {
 			t.Errorf("consume error: %v", err)
 			return
