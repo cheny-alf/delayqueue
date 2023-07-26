@@ -147,21 +147,21 @@ func (q *DelayQueue) SendDelayMsg(payload string, duration time.Duration, opts .
 // pending2ReadyScript 将消息从pending列表移入ready列表 保证原子性
 // 参数：currentTime、pendingKey、readyKey
 const pending2ReadyScript = `
-local msgs = redis.call('ZRangeByScore', ARGV[2], '0', ARGV[1])  -- get ready msg
+local msgs = redis.call('ZRangeByScore', KEYS[2], '0', ARGV[1])  -- get ready msg
 if (#msgs == 0) then return end
-local args2 = {'LPush', ARGV[3]} -- push into ready
+local args2 = {'LPush', KEYS[3]} -- push into ready
 for _,v in ipairs(msgs) do
 		table.insert(args2,v)
 end
 redis.call(unpack(args2))
-redis.call('ZRemRangeByScore',ARGV[2],'0',ARGV[1])
+redis.call('ZRemRangeByScore',KEYS[1],'0',ARGV[1])
 `
 
 func (q *DelayQueue) pending2Ready() error {
 	now := time.Now().Unix()
 	ctx := context.Background()
 	keys := []string{q.pendingKey, q.readyKey}
-	err := q.redisCli.Eval(ctx, pending2ReadyScript, keys, now, q.pendingKey, q.readyKey).Err()
+	err := q.redisCli.Eval(ctx, pending2ReadyScript, keys, now).Err()
 	if err != nil && err != redis.Nil {
 		return fmt.Errorf("pending2ReadyScript failed: %v", err)
 	}
@@ -171,9 +171,9 @@ func (q *DelayQueue) pending2Ready() error {
 // ready2UnackScript 将一条等待投递的消息从 ready （或 retry） 移动到 unack 中，并把消息发送给消费者。
 // 参数: retryTime, readyKey/retryKey, unackKey
 const ready2UnackScript = `
-local msg = redis.call('RPop',ARGV[2])
+local msg = redis.call('RPop',KEYS[1])
 if (not msg) then return end
-redis.call('ZAdd',ARGV[3],ARGV[1],msg)
+redis.call('ZAdd',KEYS[2],ARGV[1],msg)
 return msg
 `
 
@@ -181,7 +181,7 @@ func (q *DelayQueue) ready2Unack() (string, error) {
 	retryTime := time.Now().Add(q.maxConsumeDuration).Unix()
 	ctx := context.Background()
 	keys := []string{q.readyKey, q.unAckKey}
-	ret, err := q.redisCli.Eval(ctx, ready2UnackScript, keys, retryTime, q.readyKey, q.unAckKey).Result()
+	ret, err := q.redisCli.Eval(ctx, ready2UnackScript, keys, retryTime).Result()
 	if err == redis.Nil {
 		return "", err
 	}
@@ -254,30 +254,29 @@ func (q DelayQueue) nack(idStr string) error {
 // 由于DelayQueue无法在eval unack2RetryScript之前确定垃圾消息，
 // 因此无法将keys参数传递给redisCli.eval
 // 因此unack2ReteryScript将垃圾消息移动到garbageKey，而不是直接删除
-// argv: currentTime, unackKey, retryCountKey, retryKey, garbageKey
+// KEYS: currentTime, unackKey, retryCountKey, retryKey, garbageKey
 const unack2RetryScript = `
-local msgs = redis.call('ZRangeByScore', ARGV[2], '0', ARGV[1])  -- get retry msg
+local msgs = redis.call('ZRangeByScore', KEYS[1], '0', ARGV[1])  -- get retry msg
 if (#msgs == 0) then return end
-local retryCounts = redis.call('HMGet', ARGV[3], unpack(msgs)) -- get retry count
+local retryCounts = redis.call('HMGet', KEYS[2], unpack(msgs)) -- get retry count
 for i,v in ipairs(retryCounts) do
 	local k = msgs[i]
 	if tonumber(v) > 0 then
-		redis.call("HIncrBy", ARGV[3], k, -1) -- reduce retry count
-		redis.call("LPush", ARGV[4], k) -- add to retry
+		redis.call("HIncrBy", KEYS[2], k, -1) -- reduce retry count
+		redis.call("LPush", KEYS[3], k) -- add to retry
 	else
-		redis.call("HDel", ARGV[3], k) -- del retry count
-		redis.call("SAdd", ARGV[5], k) -- add to garbage
+		redis.call("HDel", KEYS[2], k) -- del retry count
+		redis.call("SAdd", KEYS[4], k) -- add to garbage
 	end
 end
-redis.call('ZRemRangeByScore', ARGV[2], '0', ARGV[1])  -- remove msgs from unack
+redis.call('ZRemRangeByScore', KEYS[1], '0', ARGV[1])  -- remove msgs from unack
 `
 
 func (q *DelayQueue) unack2Retry() error {
 	ctx := context.Background()
-	keys := []string{q.unAckKey, q.retryKey, q.retryCountKey, q.garbageKey}
+	keys := []string{q.unAckKey, q.retryCountKey, q.retryKey, q.garbageKey}
 	now := time.Now()
-	err := q.redisCli.Eval(ctx, unack2RetryScript, keys,
-		now.Unix(), q.unAckKey, q.retryCountKey, q.retryKey, q.garbageKey).Err()
+	err := q.redisCli.Eval(ctx, unack2RetryScript, keys, now.Unix()).Err()
 	if err != nil && err != redis.Nil {
 		return fmt.Errorf("unack to retry script failed:%v", err)
 	}
