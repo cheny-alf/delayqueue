@@ -237,6 +237,19 @@ func (q *DelayQueue) ack(idStr string) error {
 	return nil
 }
 
+func (q DelayQueue) nack(idStr string) error {
+	ctx := context.Background()
+	//更新重试时间为现在，unack2Retry 将立即将其重试
+	err := q.redisCli.ZAdd(ctx, q.unAckKey, &redis.Z{
+		Score:  float64(time.Now().Unix()),
+		Member: idStr,
+	}).Err()
+	if err != nil {
+		return fmt.Errorf("negative ack failed:%v", err)
+	}
+	return nil
+}
+
 // unack2RetryScript 将retryCount>0的消息从unack列表 移动到retry列表中
 // 由于DelayQueue无法在eval unack2RetryScript之前确定垃圾消息，
 // 因此无法将keys参数传递给redisCli.eval
@@ -321,9 +334,11 @@ func (q *DelayQueue) consume() error {
 		}
 		if ack {
 			err = q.ack(idStr)
-			if err != nil {
-				return err
-			}
+		} else {
+			err = q.nack(idStr)
+		}
+		if err != nil {
+			return err
 		}
 		if fetchCount >= q.fetchLimit {
 			break
@@ -355,9 +370,11 @@ func (q *DelayQueue) consume() error {
 		}
 		if ack {
 			err = q.ack(idStr)
-			if err != nil {
-				return err
-			}
+		} else {
+			err = q.nack(idStr)
+		}
+		if err != nil {
+			return err
 		}
 		if fetchCount >= q.fetchLimit {
 			break
