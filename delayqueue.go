@@ -6,7 +6,7 @@ import (
 	"github.com/go-redis/redis/v8"
 	"github.com/google/uuid"
 	"log"
-	"math"
+	"sync"
 	"time"
 )
 
@@ -29,6 +29,7 @@ type DelayQueue struct {
 	defaultRetryCount  uint
 	fetchInterval      time.Duration
 	fetchLimit         uint
+	concurrent         uint
 }
 
 // NewDelayQueue 创建新的Queue
@@ -58,7 +59,7 @@ func NewDelayQueue(name string, redisCli *redis.Client, callback func(string) bo
 		msgTTL:             time.Hour,
 		defaultRetryCount:  3,
 		fetchInterval:      time.Second,
-		fetchLimit:         math.MaxInt32,
+		concurrent:         1,
 	}
 }
 
@@ -90,6 +91,14 @@ func (q *DelayQueue) WithFetchLimit(limit uint) *DelayQueue {
 // WithDefaultRetryCount 自定义最大重试次数
 func (q *DelayQueue) WithDefaultRetryCount(count uint) *DelayQueue {
 	q.defaultRetryCount = count
+	return q
+}
+
+// WithConcurrent 自定义并发数
+func (q *DelayQueue) WithConcurrent(c uint) *DelayQueue {
+	if c > 0 {
+		q.concurrent = c
+	}
 	return q
 }
 
@@ -213,18 +222,60 @@ func (q *DelayQueue) retry2Unack() (string, error) {
 	return str, nil
 }
 
-func (q *DelayQueue) callback(idStr string) (bool, error) {
+func (q *DelayQueue) callback(idStr string) error {
 	ctx := context.Background()
 	payload, err := q.redisCli.Get(ctx, q.genMsgKey(idStr)).Result()
 	if err == redis.Nil {
-		return true, nil
+		return nil
 	}
 	if err != nil {
-		return false, fmt.Errorf("get message payload failed:%v", err)
+		return fmt.Errorf("get message payload failed:%v", err)
 	}
-	return q.cb(payload), nil
+	ack := q.cb(payload)
+	if ack {
+		err = q.ack(idStr)
+	} else {
+		err = q.nack(idStr)
+	}
+	return err
 }
 
+// batchCallback calls DelayQueue.callback in batch. callback is executed concurrently according to property DelayQueue.concurrent
+// batchCallback must wait all callback finished, otherwise the actual number of processing messages may beyond DelayQueue.FetchLimit
+func (q *DelayQueue) batchCallback(ids []string) {
+	if len(ids) == 1 || q.concurrent == 1 {
+		for _, id := range ids {
+			err := q.callback(id)
+			if err != nil {
+				q.logger.Printf("consume msg %s failed:%v", id, err)
+			}
+		}
+		return
+	}
+	ch := make(chan string, len(ids))
+	for _, id := range ids {
+		ch <- id
+	}
+	close(ch)
+	wg := sync.WaitGroup{}
+	concurrent := int(q.concurrent)
+	if concurrent > len(ch) {
+		concurrent = len(ch)
+	}
+	wg.Add(concurrent)
+	for i := 0; i < concurrent; i++ {
+		go func() {
+			defer wg.Done()
+			for id := range ch {
+				err := q.callback(id)
+				if err != nil {
+					q.logger.Printf("consume msg %s failed: %v", id, err)
+				}
+			}
+		}()
+	}
+	wg.Wait()
+}
 func (q *DelayQueue) ack(idStr string) error {
 	ctx := context.Background()
 	err := q.redisCli.ZRem(ctx, q.unAckKey, idStr).Err()
@@ -317,7 +368,7 @@ func (q *DelayQueue) consume() error {
 		return err
 	}
 	//consume
-	var fetchCount uint
+	ids := make([]string, 0, q.fetchLimit)
 	for true {
 		idStr, err := q.ready2Unack()
 		if err == redis.Nil {
@@ -326,22 +377,13 @@ func (q *DelayQueue) consume() error {
 		if err != nil {
 			return err
 		}
-		fetchCount++
-		ack, err := q.callback(idStr)
-		if err != nil {
-			return err
-		}
-		if ack {
-			err = q.ack(idStr)
-		} else {
-			err = q.nack(idStr)
-		}
-		if err != nil {
-			return err
-		}
-		if fetchCount >= q.fetchLimit {
+		ids = append(ids, idStr)
+		if q.fetchLimit > 0 && len(ids) >= int(q.fetchLimit) {
 			break
 		}
+	}
+	if len(ids) > 0 {
+		q.batchCallback(ids)
 	}
 	// unack to retry
 	err = q.unack2Retry()
@@ -353,7 +395,7 @@ func (q *DelayQueue) consume() error {
 		return err
 	}
 	//retry
-	fetchCount = 0
+	ids = make([]string, 0, q.fetchLimit)
 	for true {
 		idStr, err := q.retry2Unack()
 		if err == redis.Nil {
@@ -362,22 +404,13 @@ func (q *DelayQueue) consume() error {
 		if err != nil {
 			return err
 		}
-		fetchCount++
-		ack, err := q.callback(idStr)
-		if err != nil {
-			return err
-		}
-		if ack {
-			err = q.ack(idStr)
-		} else {
-			err = q.nack(idStr)
-		}
-		if err != nil {
-			return err
-		}
-		if fetchCount >= q.fetchLimit {
+		ids = append(ids, idStr)
+		if q.fetchLimit > 0 && len(ids) >= int(q.fetchLimit) {
 			break
 		}
+	}
+	if len(ids) > 0 {
+		q.batchCallback(ids)
 	}
 	return nil
 }
@@ -400,14 +433,14 @@ func (q *DelayQueue) StartConsume() (done <-chan struct{}) {
 				break tickerLoop
 			}
 		}
-		done0 <- struct{}{}
+		close(done0)
 	}()
 	return done0
 }
 
 // StopConsume 停止消费者协程
 func (q *DelayQueue) StopConsume() {
-	q.close <- struct{}{}
+	close(q.close)
 	if q.ticker != nil {
 		q.ticker.Stop()
 	}
