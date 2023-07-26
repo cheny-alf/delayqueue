@@ -4,9 +4,9 @@ import (
 	"context"
 	"fmt"
 	"github.com/go-redis/redis/v8"
+	"github.com/google/uuid"
 	"log"
 	"math"
-	"strconv"
 	"time"
 )
 
@@ -20,14 +20,13 @@ type DelayQueue struct {
 	retryKey      string            //list 存储超时后待重试的消息 element为消息ID
 	retryCountKey string            //hash 存储重试次数 field为消息ID，value为重试次数
 	garbageKey    string            //set 暂时存储已达重试上限的消息 member为消息ID
-	idGenKey      string            //递增ID
 	ticker        *time.Ticker
 	logger        *log.Logger
 	close         chan struct{}
 
 	maxConsumeDuration time.Duration
 	msgTTL             time.Duration
-	defaultRetryCount  int
+	defaultRetryCount  uint
 	fetchInterval      time.Duration
 	fetchLimit         uint
 }
@@ -53,7 +52,6 @@ func NewDelayQueue(name string, redisCli *redis.Client, callback func(string) bo
 		retryKey:           "dp:" + name + ":retry",
 		retryCountKey:      "dp:" + name + ":retry:cnt",
 		garbageKey:         "dp:" + name + ":garbage",
-		idGenKey:           "dp:" + name + ":id_gen",
 		logger:             log.Default(),
 		close:              make(chan struct{}, 1),
 		maxConsumeDuration: 5 * time.Second,
@@ -89,25 +87,14 @@ func (q *DelayQueue) WithFetchLimit(limit uint) *DelayQueue {
 	return q
 }
 
-func (q *DelayQueue) genMsgKey(idStr string) string {
-	return "dp:" + q.name + ":msg:" + idStr
+// WithDefaultRetryCount 自定义最大重试次数
+func (q *DelayQueue) WithDefaultRetryCount(count uint) *DelayQueue {
+	q.defaultRetryCount = count
+	return q
 }
 
-// 生成ID，如果已经达到int最大值，则从1重新开始
-func (q *DelayQueue) genID() (uint32, error) {
-	ctx := context.Background()
-	id, err := q.redisCli.Incr(ctx, q.idGenKey).Result()
-	if err != nil && err.Error() == "ERR increment or decrement would overflow" {
-		err = q.redisCli.Set(ctx, q.idGenKey, 1, 0).Err()
-		if err != nil {
-			return 0, fmt.Errorf("reset id gen failed: %v", err)
-		}
-		return 1, nil
-	}
-	if err != nil {
-		return 0, fmt.Errorf("incr id gen failed: %v", err)
-	}
-	return uint32(id), nil
+func (q *DelayQueue) genMsgKey(idStr string) string {
+	return "dp:" + q.name + ":msg:" + idStr
 }
 
 type retryCountOpt int
@@ -125,20 +112,16 @@ func (q *DelayQueue) SendScheduleMsg(payload string, t time.Time, opts ...interf
 	for _, opt := range opts {
 		switch o := opt.(type) {
 		case retryCountOpt:
-			retryCount = int(o)
+			retryCount = uint(o)
 		}
 	}
-	id, err := q.genID()
-	if err != nil {
-		return err
-	}
-	idStr := strconv.FormatUint(uint64(id), 10)
+	idStr := uuid.Must(uuid.NewRandom()).String()
 	ctx := context.Background()
 	now := time.Now()
 
 	//存储消息
 	msgTTL := t.Sub(now) + q.msgTTL
-	err = q.redisCli.Set(ctx, q.genMsgKey(idStr), payload, msgTTL).Err()
+	err := q.redisCli.Set(ctx, q.genMsgKey(idStr), payload, msgTTL).Err()
 	if err != nil {
 		return fmt.Errorf("store msg failed: %v", err)
 	}
@@ -148,7 +131,7 @@ func (q *DelayQueue) SendScheduleMsg(payload string, t time.Time, opts ...interf
 		return fmt.Errorf("store retry count failed: %v", err)
 	}
 	//加入pending队列
-	err = q.redisCli.ZAdd(ctx, q.pendingKey, &redis.Z{Score: float64(t.Unix()), Member: id}).Err()
+	err = q.redisCli.ZAdd(ctx, q.pendingKey, &redis.Z{Score: float64(t.Unix()), Member: idStr}).Err()
 	if err != nil {
 		return fmt.Errorf("push to pending failed: %v", err)
 	}

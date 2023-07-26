@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"github.com/go-redis/redis/v8"
 	"log"
-	"math"
 	"os"
 	"strconv"
 	"testing"
@@ -82,27 +81,6 @@ func TestDelayQueue_StopConsume(t *testing.T) {
 	}
 	done := queue.StartConsume()
 	<-done
-}
-
-func TestIDOverflow(t *testing.T) {
-	redisCli := redis.NewClient(&redis.Options{
-		Addr: "127.0.0.1:6379",
-	})
-	redisCli.FlushDB(context.Background())
-	queue := NewDelayQueue("test", redisCli, func(s string) bool {
-		return true
-	})
-	err := redisCli.Set(context.Background(), queue.idGenKey, math.MaxInt64, 0).Err()
-	if err != nil {
-		t.Error(err)
-	}
-	for i := 0; i < 10; i++ {
-		_, err := queue.genID()
-		if err != nil {
-			t.Error("id gen error")
-			return
-		}
-	}
 }
 
 func TestDelayQUeu(t *testing.T) {
