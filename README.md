@@ -23,6 +23,8 @@ queue.StopConsume()
 -  `WithFetchInterval(d time.Duration)` : 设置从Redis中拉取消息的时间间隔。
 -  `WithMaxConsumeDuration(d time.Duration)` : 设置消息的超时时间。如果在消息传递后的这段时间内未收到确认，DelayQueue将尝试再次传递此消息。
 -  `WithFetchLimit(limit uint)` : 设置单次拉取消息的数量。
+## 流程图
+![流程图-202307261206.png](%E6%B5%81%E7%A8%8B%E5%9B%BE-202307261206.png)
 ## 注意事项
 - 队列名称必须在Redis中是唯一的。
 - 回调函数应该处理消息并返回一个布尔值，表示是否应该确认消息。如果返回true，消息将被确认并从队列中删除。如果返回false，消息将被视为未确认，并可能在以后被重试。
