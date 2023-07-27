@@ -75,7 +75,7 @@ func TestDelayQueue_StopConsume(t *testing.T) {
 		return true
 	})
 	for i := 0; i < size; i++ {
-		err := queue.SendDelayMsg(strconv.Itoa(i), 0)
+		err := queue.SendDelayMsg(strconv.Itoa(i), 0, WithMsgTTL(time.Hour))
 		if err != nil {
 			t.Errorf("send message failed: %v", err)
 		}
@@ -106,7 +106,7 @@ func TestDelayQueue_ConcurrentConsume(t *testing.T) {
 		WithConcurrent(4)
 
 	for i := 0; i < size; i++ {
-		err := queue.SendDelayMsg(strconv.Itoa(i), 0, WithRetryCount(retryCount))
+		err := queue.SendDelayMsg(strconv.Itoa(i), 0, WithRetryCount(retryCount), WithMsgTTL(time.Hour))
 		if err != nil {
 			t.Error(err)
 		}

@@ -114,6 +114,12 @@ func WithRetryCount(count int) interface{} {
 	return retryCountOpt(count)
 }
 
+type msgTTLOpt time.Duration
+
+func WithMsgTTL(d time.Duration) interface{} {
+	return msgTTLOpt(d)
+}
+
 // SendScheduleMsg 发送定时消息
 func (q *DelayQueue) SendScheduleMsg(payload string, t time.Time, opts ...interface{}) error {
 	// parse options
@@ -122,6 +128,8 @@ func (q *DelayQueue) SendScheduleMsg(payload string, t time.Time, opts ...interf
 		switch o := opt.(type) {
 		case retryCountOpt:
 			retryCount = uint(o)
+		case msgTTLOpt:
+			q.msgTTL = time.Duration(o)
 		}
 	}
 	idStr := uuid.Must(uuid.NewRandom()).String()
@@ -259,6 +267,7 @@ func (q *DelayQueue) batchCallback(ids []string) {
 	close(ch)
 	wg := sync.WaitGroup{}
 	concurrent := int(q.concurrent)
+	// 无需太多的协程
 	if concurrent > len(ch) {
 		concurrent = len(ch)
 	}
